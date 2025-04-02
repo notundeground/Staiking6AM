@@ -2,7 +2,13 @@ const int error::unknown_op = 0xffff;
 
 const int error::wrong_sender = 0x9283;
 const int error::wrong_state = 0x9284;
+
+;; System errors
 const int error::halted = 0x9285;
+const int error::not_admin = 0x1338;
+const int error::wallet_frozen = 0x1337;
+const int error::invalid_amount = 0x1339;
+const int error::invalid_address = 0x133A;
 
 const int sudoer::quarantine = 0xa000;
 const int error::governor_update_too_soon = 0xa001;
@@ -17,6 +23,7 @@ const int error::borrowing_request_in_closed_round = 0xf104;
 const int error::deposit_amount_too_low = 0xf200;
 const int error::deposits_are_closed = 0xf201;
 const int error::output_amount_is_zero = 0xf202;
+const int error::stake_amount_below_minimum = 0xf203;  ;; Amount is below minimum stake requirement
 
 const int error::not_enough_TON_to_process = 0xf300;
 
@@ -38,7 +45,6 @@ const int error::no_new_hash = 0xf701;
 const int error::withdrawal_while_credited = 0xf800;
 const int error::incorrect_withdrawal_amount = 0xf801;
 
-
 const int error::incorrect_new_stake::query_id = 0xf900;
 const int error::incorrect_new_stake::request_value = 0xf901;
 const int error::incorrect_new_stake::value_lt_minimum = 0xf902;
@@ -46,13 +52,16 @@ const int error::incorrect_new_stake::value_too_high = 0xf903;
 const int error::incorrect_new_stake::wrongly_used_credit = 0xf904;
 const int error::incorrect_new_stake::solvency_not_guaranteed = 0xf905;
 
-
 const int error::controller_not_approved = 0xfa00;
 const int error::multiple_loans_are_prohibited = 0xfa01;
 const int error::too_early_loan_request = 0xfa02;
 const int error::too_late_loan_request = 0xfa03;
 const int error::too_high_loan_request_amount = 0xfa04;
 const int error::credit_interest_too_high = 0xfa05;
+
+;; Unstaking errors
+const int error::no_pending_unstake = 0xf600;   ;; No pending unstake found for this address
+const int error::unstake_not_ready = 0xf601;    ;; Unstake lockup period has not elapsed yet
 
 const int error::no_credit = 0xfb00;
 const int error::too_early_loan_return = 0xfb01;

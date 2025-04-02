@@ -91,7 +91,15 @@ builder store_masterchain_address(builder b, int address_hash) inline {
       sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE | sendmode::IGNORE_ERRORS); ;; non-bouneable, remaining inbound message amount, fee deducted from amount, ignore errors
 }
 
-
+() send_message_to_controller(slice controller_address, int op, int query_id, int amount, int mode) impure inline_ref {
+    var msg = begin_cell()
+            .store_msg_flags(msgflag::BOUNCEABLE)
+            .store_slice(controller_address)
+            .store_coins(amount)
+            .store_msgbody_prefix_slice()
+            .store_body_header(op, query_id);
+    send_raw_message(msg.end_cell(), mode);
+}
 
 () emit_log (int topic, builder data) impure inline {
     ;; 1023 - (4+2+9+256+64+32+2) = 654 bit free
@@ -112,4 +120,3 @@ builder store_masterchain_address(builder b, int address_hash) inline {
 
     send_raw_message(msg.end_cell(), sendmode::REGULAR);
 }
-

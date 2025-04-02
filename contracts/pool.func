@@ -53,19 +53,11 @@ global cell controller_code;
 global cell pool_jetton_wallet_code;
 global cell payout_minter_code;
 
-
-;; temporal variables (not saved to storage)
-global int sent_during_rotation;
-global int current_round_closed?; ;; hash of validator set changed since round start
-
+;; Constants
 const int state::NORMAL = 0;
 
-
-const int DISBALANCE_TOLERANCE = 30; ;; x/256
-const int JETTONS_WORKCHAIN = 0;
-const int MAX_LOAN_DICT_DEPTH = 12;
-
 const int ONE_TON = 1000000000;
+const int MIN_STAKE_AMOUNT = 10 * ONE_TON;  ;; 10 TON minimum stake requirement
 const int MIN_TONS_FOR_STORAGE = 10 * ONE_TON; ;; 10 TON
 const int CONTROLLER_WORKCHAIN = MASTERCHAIN;
 
@@ -73,8 +65,9 @@ const int SERVICE_NOTIFICATION_AMOUNT = 2 * ONE_TON / 100;
 ;; finalize fee goes to
 ;;   a) SERVICE_NOTIFICATION_AMOUNT to interest manager
 ;;   b) TRANSFER_NOTIFICATION_AMOUNT for ton distribution start
-;;   c) TRANSFER_NOTIFICATION_AMOUNT + POOL_JETTON_WALLET_FEE + POOL_JETTON_MINT_FEE for jetton distribution
+;;   c) PAYOUT_DISTRIBUTION_AMOUNT for payout distribution start
 ;;   d) Gas fees
+
 const int FINALIZE_ROUND_FEE = ONE_TON;
 const int DEPOSIT_FEE = ONE_TON;
 const int WITHDRAWAL_FEE = ONE_TON / 2;
@@ -83,6 +76,15 @@ const int MAX_POOL_GAS_ON_USER_ACTION = ONE_TON / 3;
 const int PAYOUT_DISTRIBUTION_AMOUNT = ONE_TON / 5; ;; we will get excesses back
 const int MINTER_DEPLOY_FEE = ONE_TON / 10;
 
+const int DISBALANCE_TOLERANCE = 30; ;; x/256
+const int JETTONS_WORKCHAIN = 0;
+const int MAX_LOAN_DICT_DEPTH = 12;
+
+const int UNSTAKE_DELAY = 122400;  ;; 34 hours in seconds
+const int UNSTAKE_DICT_KEY_LEN = 267;  ;; Length for MsgAddress in dict
+
+;; Storage
+global cell pending_unstakes;  ;; Dictionary to store pending unstakes
 
 #include "pool_storage.func";
 
@@ -90,7 +92,6 @@ const int MINTER_DEPLOY_FEE = ONE_TON / 10;
 () log_repayment (slice, int, int) impure;
 () log_round_completion (int, int, int, int, int, int) impure;
 () log_round_rotation (int) impure;
-
 ([cell, int, int, int, int, int, int], ()) finalize_lending_round([cell, int, int, int, int, int, int] borrowers_data, int available_balance)  impure; ;; called from close_loan
 () finalize_deposit_withdrawal_round (int available_balance, int round_id)  impure; ;; called from finalize_lending_round
 
@@ -128,7 +129,6 @@ int muldiv_extra(int a, int b, int c) inline {
 }
 
 () update_round(int available_balance) impure inline_ref {
-    sent_during_rotation = 0;
     if(halted?) {
         return ();
     }
@@ -139,20 +139,88 @@ int muldiv_extra(int a, int b, int c) inline {
         var [borrowers_dict, round_id, active_borrowers, borrowed, expected, returned, profit] = prev_round_borrowers;
 
         if((~ borrowers_dict.null?()) | (active_borrowers > 0)) {
-            current_round_closed? = true;
             return ();
         }
-        untouched_data = null();
         prev_round_borrowers~finalize_lending_round(available_balance);
 
         saved_validator_set_hash = current_hash;
         int round_index = current_round_index() + 1;
         log_round_rotation(round_index);
         (prev_round_borrowers, current_round_borrowers) = (current_round_borrowers, [null(), round_index, 0, 0, 0, 0, 0]);
-        current_round_closed? = false;
-    } else {
-        current_round_closed? = false;
     }
+}
+
+;; Unstaking data structure functions
+cell pack_unstake_data(int amount, int unlock_time) inline {
+    return begin_cell()
+        .store_coins(amount)
+        .store_uint(unlock_time, 32)
+        .end_cell();
+}
+
+(int, int) unpack_unstake_data(cell data) inline {
+    slice ds = data.begin_parse();
+    return (ds~load_coins(), ds~load_uint(32));
+}
+
+() process_unstake_request(slice sender_address, int jetton_amount, int query_id, int msg_value) impure inline {
+    throw_unless(error::not_enough_TON_to_process, msg_value > WITHDRAWAL_FEE);
+    update_round(pair_first(get_balance()) - msg_value);
+    assert_not_halted!();
+    
+    int ton_amount = muldiv(jetton_amount, total_balance, supply);
+    throw_unless(error::output_amount_is_zero, ton_amount > 0);
+    
+    int unlock_time = now() + UNSTAKE_DELAY;
+    
+    ;; Check for existing unstake request
+    (cell existing_data, int found?) = pending_unstakes.udict_get?(UNSTAKE_DICT_KEY_LEN, sender_address);
+    if (found?) {
+        (int old_amount, _) = unpack_unstake_data(existing_data);
+        ton_amount += old_amount;
+    }
+    
+    ;; Save new unstake request
+    pending_unstakes~udict_set(UNSTAKE_DICT_KEY_LEN, sender_address, pack_unstake_data(ton_amount, unlock_time));
+    
+    ;; Update pool state
+    total_balance -= ton_amount;
+    supply -= jetton_amount;
+    
+    ;; Reserve for storage
+    raw_reserve(MIN_TONS_FOR_STORAGE, 0);
+    
+    ;; Send confirmation
+    var msg = begin_cell()
+        .store_msg_flags(msgflag::NON_BOUNCEABLE)
+        .store_slice(sender_address)
+        .store_coins(WITHDRAWAL_FEE)
+        .store_msgbody_prefix_slice()
+        .store_body_header(pool::unstake_pending, query_id)
+        .store_coins(ton_amount)
+        .store_uint(unlock_time, 32);
+    send_raw_message(msg.end_cell(), sendmode::REGULAR);
+}
+
+() process_unstake_claim(slice sender_address) impure inline {
+    ;; Get unstake data
+    (cell unstake_data, int success) = pending_unstakes.udict_get?(UNSTAKE_DICT_KEY_LEN, sender_address);
+    throw_unless(error::no_pending_unstake, success);
+    
+    ;; Check unlock time
+    (int amount, int unlock_time) = unpack_unstake_data(unstake_data);
+    throw_unless(error::unstake_not_ready, now() >= unlock_time);
+    
+    ;; Remove unstake request
+    pending_unstakes~udict_delete?(UNSTAKE_DICT_KEY_LEN, sender_address);
+    
+    ;; Reserve for storage and send TON
+    raw_reserve(MIN_TONS_FOR_STORAGE, 0);
+    var msg = begin_cell()
+        .store_msg_flags(msgflag::NON_BOUNCEABLE)
+        .store_slice(sender_address)
+        .store_coins(0);
+    send_raw_message(msg.end_cell(), sendmode::CARRY_ALL_BALANCE);
 }
 
 () recv_internal(int balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
@@ -182,63 +250,15 @@ int muldiv_extra(int a, int b, int c) inline {
         assert_sender!(sender_address, jetton_minter);
         int jetton_amount = in_msg_body~load_coins();
         slice from_address = in_msg_body~load_msg_addr();
-        ;; response will be ignored
         slice response_address = in_msg_body~load_msg_addr();
-        ;; after that point we should not revert because jettons should not be lost
-        try {
-            throw_unless(error::not_enough_TON_to_process, msg_value > WITHDRAWAL_FEE);
-            int request_immediate_withdrawal_if_possible = ~ in_msg_body~load_bool();
-            int fill_or_kill = in_msg_body~load_bool();
-            update_round(pair_first(get_balance()) - msg_value);
-            assert_not_halted!(); ;; otherwise mint back
-            int approximate_amount = muldiv(jetton_amount, total_balance, supply);
-            int available_funds = balance - msg_value - MIN_TONS_FOR_STORAGE - sent_during_rotation;
-
-            if(optimistic_deposit_withdrawals &
-                    request_immediate_withdrawal_if_possible &
-                    (state == state::NORMAL) &
-                    (available_funds > approximate_amount)) {
-                throw_unless(error::output_amount_is_zero, approximate_amount > 0);
-                total_balance -= approximate_amount;
-                supply -= jetton_amount;
-                raw_reserve(balance - msg_value - approximate_amount - sent_during_rotation, 0);
-                available_funds -= approximate_amount;
-                var msg = begin_cell()
-                        .store_msg_flags(msgflag::NON_BOUNCEABLE)
-                        .store_slice(from_address)
-                        .store_coins(0)
-                        .store_msgbody_prefix_slice()
-                        .store_body_header(pool::withdrawal, query_id);
-                send_raw_message(msg.end_cell(), sendmode::CARRY_ALL_BALANCE);
-            } else {
-                throw_if(105, fill_or_kill);
-                throw_unless(error::output_amount_is_zero, jetton_amount);
-                raw_reserve(balance - msg_value - sent_during_rotation, 0);
-                request_to_mint_withdrawal(from_address, jetton_amount, query_id);
-            }
-            ;;  conservatively use `borrowed` instead of `expected` as amount that will be returned
-            var [_, _, _, borrowed, _, _, _] = prev_round_borrowers;
-
-            ;; max(*, 0) is needed because optimistic withdrawals do not participate in sharing -FINALIZE_ROUND_FEE
-            ;; When we have both optimistic and pessimistic withdrawals it is ok: pessimists will get both
-            ;; FINALIZE_ROUND_FEE loss and pool round profit. The only problem is when optimists withdraw 100% value
-            ;; and there is no profit to cover FINALIZE_ROUND_FEE. In this case available_funds may become negative
-            ;; and max(*,0) helps with that
-
-            int funds_at_round_end = max(available_funds + borrowed - FINALIZE_ROUND_FEE, 0);
-            (int projected_balance, int projected_supply) = _get_projected_conversion_ratio ();
-            throw_unless( 100, ;; error_code doesn't matter it will be catched
-                         funds_at_round_end >= muldiv_extra(requested_for_withdrawal, projected_balance, projected_supply));
-        } catch (exc_arg, exc_num) {
-            ;; note that sent_during_rotation is null because
-            ;; effect of update_round is reverted in catch
-            raw_reserve(balance - msg_value, 0);
-            ;; request_to_mint automatically increase supply by minted amount
-            ;; however there is no extra tokens in this case
-            supply -= jetton_amount;
-            request_to_mint_pool_jettons(from_address, jetton_amount, query_id, true);
-        }
         
+        ;; Skip unused parameters from old implementation
+        var (_, _) = (in_msg_body~load_bool(), in_msg_body~load_bool());
+        
+        process_unstake_request(from_address, jetton_amount, query_id, msg_value);
+        
+    } elseif (op == pool::claim_unstake) {
+        process_unstake_claim(sender_address);
     {- ========== Governance operations ========== -}
     } elseif (op == sudo::send_message) {
                 process_sudo_request(sender_address, in_msg_body);
@@ -285,6 +305,7 @@ int muldiv_extra(int a, int b, int c) inline {
         if (op == pool::deposit) {
                 assert_state!(state::NORMAL);
                 throw_unless(error::deposits_are_closed, deposits_open?);
+                throw_unless(error::stake_amount_below_minimum, msg_value >= (MIN_STAKE_AMOUNT + DEPOSIT_FEE));  ;; Check minimum stake
                 raw_reserve(balance - DEPOSIT_FEE - sent_during_rotation, 0);
                 int deposit_amount = msg_value - DEPOSIT_FEE;
                 throw_unless(error::deposit_amount_too_low, deposit_amount > 0);
@@ -333,7 +354,7 @@ int muldiv_extra(int a, int b, int c) inline {
 
               throw_unless(error::not_enough_funds_for_loan, actual_loan >=  min_loan);
 
-              int interest = muldiv(actual_loan, interest_rate, SHARE_BASIS);
+              int interest = muldiv(actual_loan, interest_rate, 65536);
               builder msg = begin_cell()
                         .store_msg_flags(msgflag::BOUNCEABLE)
                         .store_slice(sender_address)
@@ -485,7 +506,7 @@ int muldiv_extra(int a, int b, int c) inline {
     profit -= FINALIZE_ROUND_FEE;
 
     ;; governance_fee / 65536 < 1 ratio, share to send to governance
-    int fee = max(muldiv(governance_fee, profit, SHARE_BASIS), 0);
+    int fee = max(muldiv(governance_fee, profit, 65536), 0);
     profit -= fee;
 
     ;; if there is negative profit (loss), then it can take maximum all the balance
@@ -611,7 +632,7 @@ int muldiv_extra(int a, int b, int c) inline {
 (int, int) _get_projected_conversion_ratio () inline {
     var [borrowers_dict, round_id, active_borrowers, borrowed, expected, returned, profit] = prev_round_borrowers;
     int expected_profit = expected - borrowed - FINALIZE_ROUND_FEE;
-    int fee = max(muldiv(governance_fee, expected_profit, SHARE_BASIS), 0);
+    int fee = max(muldiv(governance_fee, expected_profit, 65536), 0);
     expected_profit -= fee;
     return (max(total_balance + expected_profit, 0), supply);
 }
@@ -752,7 +773,7 @@ int calculate_loan_amount(int min_loan, int max_loan, int max_interest) method_i
         return -1;
     }
 
-    int interest = muldiv(actual_loan, interest_rate, SHARE_BASIS);
+    int interest = muldiv(actual_loan, interest_rate, 65536);
 
     return actual_loan + interest;
 }

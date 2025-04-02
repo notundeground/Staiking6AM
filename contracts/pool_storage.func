@@ -1,4 +1,13 @@
-;;[borrowers_dict, round_id, active_borrowers, borrowed, expected, returned, profit]
+;; Dictionary utils
+() ~store_dict(builder b, cell dict) inline {
+    b = b.store_dict(dict);
+}
+
+(cell) ~load_dict(slice s) inline {
+    return s~load_dict();
+}
+
+;; Load/save round data
 (slice, ([cell, int, int, int, int, int, int])) ~load_round_data(slice s) inline {
     slice ds = s~load_ref().begin_parse();
     var data = [ds~load_dict(),             ;; borrowers
@@ -146,28 +155,25 @@ builder save_codes(builder pb) inline {
 global slice untouched_data;
 
 () load_data() impure inline_ref {
-
-    ;; this check should be removed in production
-    ;; it ensures that load_data is not loaded twice
-    ;;throw_unless(2222, state.null?());
-
     slice ds = get_data().begin_parse();
     state = ds~load_uint(8);
     halted? = ds~load_bool();
     total_balance = ds~load_coins();
-    ds~load_minters_data();
-    untouched_data = ds;
+    
+    ds~load_minters_data() ~tpop();
+    ds~load_roles() ~tpop();
+    ds~load_codes() ~tpop();
+    ds~load_round_data() ~tpop(prev_round_borrowers);
+    ds~load_round_data() ~tpop(current_round_borrowers);
+    
     interest_rate = ds~load_share();
-    optimistic_deposit_withdrawals = ds~load_bool();
+    optimistic_deposit_withdrawals = false;  ;; Always false now - disabled optimistic withdrawals
     deposits_open? = ds~load_bool();
     saved_validator_set_hash = ds~load_uint(256);
-    slice round_data = ds~load_ref().begin_parse();
-        current_round_borrowers = round_data~load_round_data();
-        prev_round_borrowers = round_data~load_round_data();
-    loan_params_per_validator = [ds~load_coins(), ds~load_coins()];
-    governance_fee = ds~load_share();
-    ds~load_roles();
-    ds~load_codes();
+    
+    pending_unstakes = ds~load_dict() ?? new_dict();  ;; Initialize empty dict if not present
+    
+    [int min_loan_per_validator, int max_loan_per_validator] = loan_params_per_validator;
 }
 
 () save_data() impure inline_ref {
@@ -177,21 +183,18 @@ global slice untouched_data;
         .store_bool(halted?)
         .store_coins(total_balance)
         .save_minters_data()
+        .save_roles()
+        .save_codes()
+        .store_round_data(prev_round_borrowers)
+        .store_round_data(current_round_borrowers)
         .store_share(interest_rate)
-        .store_bool(optimistic_deposit_withdrawals)
+        .store_bool(false)  ;; optimistic_deposit_withdrawals disabled
         .store_bool(deposits_open?)
         .store_uint(saved_validator_set_hash, 256)
-        .store_ref(
-          begin_cell()
-          .store_round_data(current_round_borrowers)
-          .store_round_data(prev_round_borrowers)
-          .end_cell()
-        )
+        .store_dict(pending_unstakes)  ;; Save unstaking dictionary
         .store_coins(min_loan_per_validator)
         .store_coins(max_loan_per_validator)
         .store_share(governance_fee)
-        .save_roles()
-        .save_codes()
         .end_cell()
     );
 }
